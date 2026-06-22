@@ -11,6 +11,22 @@ Deno.serve((req: Request) => {
     });
   }
 
+  const demoToken = Deno.env.get("DEMO_TOKEN");
+  const requestToken = req.headers.get("x-demo-token");
+
+  if (!demoToken || requestToken !== demoToken) {
+    return Response.json(
+      {
+        ok: false,
+        error: "Unauthorized",
+      },
+      {
+        status: 401,
+        headers: corsHeaders,
+      },
+    );
+  }
+
   return Response.json(
     {
       ok: true,
@@ -20,6 +36,7 @@ Deno.serve((req: Request) => {
       message: "Supabase backend core is working",
     },
     {
+      status: 200,
       headers: corsHeaders,
     },
   );
