@@ -151,9 +151,16 @@ Deno.serve(async (req: Request) => {
       ? await buildPortfolioInsightsResponse(config, body)
       : await buildPortfolioLatestResponse(config, body);
 
-    return Response.json(response, {
+    const responseBody = JSON.stringify(response);
+
+    return new Response(responseBody, {
       status: 200,
-      headers: corsHeaders,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "application/json",
+        "Content-Length": String(new TextEncoder().encode(responseBody).length),
+        "Connection": "close",
+      },
     });
   }
 
@@ -432,26 +439,30 @@ async function buildPortfolioInsightsResponse(config: TopvisorConfig, body: Summ
   const itemsWithoutData = insightItems.filter((item) => !item.flags.has_data).length;
   const itemsNeedingAttention = insightItems.filter((item) => item.flags.needs_attention).length;
 
+  const insightsSummary = {
+    items_total: insightItems.length,
+    items_success: itemsSuccess,
+    items_failed: itemsFailed,
+    avg_top10_pct: avgTop10Pct,
+    min_top10_pct: minTop10Pct,
+    max_top10_pct: maxTop10Pct,
+    items_with_fallback: itemsWithFallback,
+    items_without_data: itemsWithoutData,
+    items_needing_attention: itemsNeedingAttention,
+  };
+
   return {
     ok: true,
     service: "ai-seo-analyst",
     scenario: "portfolio-insights",
     mode: "portfolio_insights",
     request: latestResponse.request,
-    summary: {
-      items_total: insightItems.length,
-      items_success: itemsSuccess,
-      items_failed: itemsFailed,
-      avg_top10_pct: avgTop10Pct,
-      min_top10_pct: minTop10Pct,
-      max_top10_pct: maxTop10Pct,
-      items_with_fallback: itemsWithFallback,
-      items_without_data: itemsWithoutData,
-      items_needing_attention: itemsNeedingAttention,
-    },
+    summary: insightsSummary,
+    scenario_blocks: buildScenarioBlocks(insightItems, insightsSummary),
     items: insightItems,
     warnings: [
       "This is a demo-MVP analytical layer. It identifies signals, not SEO causes.",
+      "Scenario blocks are based on simple MVP heuristics and do not explain SEO causes.",
       ...latestResponse.warnings,
     ],
   };
@@ -540,6 +551,187 @@ function compareInsightItems(a: PortfolioInsightItem, b: PortfolioInsightItem): 
   return aTop10 - bTop10;
 }
 
+function buildScenarioBlocks(items: PortfolioInsightItem[], summary: {
+  items_total: number;
+  items_success: number;
+  items_failed: number;
+  avg_top10_pct: number | null;
+  min_top10_pct: number | null;
+  max_top10_pct: number | null;
+  items_with_fallback: number;
+  items_without_data: number;
+  items_needing_attention: number;
+}) {
+  return {
+    portfolio_health_summary: buildPortfolioHealthSummary(items, summary),
+    problem_projects: items
+      .filter((item) => item.flags.needs_attention)
+      .sort(compareProblemProjects)
+      .slice(0, 5)
+      .map(toScenarioBlockItem),
+    stale_data_projects: items
+      .filter((item) => !item.flags.has_fresh_data)
+      .sort(compareStaleDataProjects)
+      .slice(0, 5)
+      .map(toScenarioBlockItem),
+    critical_top10_projects: items
+      .filter((item) => item.ok && item.flags.top10_level === "critical")
+      .sort((a, b) => Number(a.top10_pct) - Number(b.top10_pct))
+      .slice(0, 5)
+      .map(toScenarioBlockItem),
+    attention_queue: items
+      .filter((item) => item.flags.needs_attention)
+      .sort(compareProblemProjects)
+      .slice(0, 10)
+      .map(toScenarioBlockItem),
+  };
+}
+
+function buildPortfolioHealthSummary(items: PortfolioInsightItem[], summary: {
+  items_total: number;
+  items_success: number;
+  items_failed: number;
+  avg_top10_pct: number | null;
+  items_with_fallback: number;
+  items_without_data: number;
+  items_needing_attention: number;
+}) {
+  const criticalTop10Count = items.filter((item) => item.flags.top10_level === "critical").length;
+
+  let status = "stable";
+
+  if (summary.items_success === 0) {
+    status = "unknown";
+  } else if (summary.items_failed > 0 || (summary.avg_top10_pct !== null && summary.avg_top10_pct < 10)) {
+    status = "critical";
+  } else if (summary.items_needing_attention > 0) {
+    status = "attention_required";
+  }
+
+  const shortSignals: string[] = [];
+
+  if (summary.items_without_data > 0) {
+    shortSignals.push(`${summary.items_without_data} project has no valid data.`);
+  }
+
+  if (summary.items_with_fallback > 0) {
+    shortSignals.push(`${summary.items_with_fallback} project used fallback data.`);
+  }
+
+  if (criticalTop10Count > 0) {
+    shortSignals.push(`${criticalTop10Count} project has critical TOP-10 level.`);
+  }
+
+  if (shortSignals.length === 0) {
+    shortSignals.push("No critical MVP signals detected.");
+  }
+
+  return {
+    status,
+    items_total: summary.items_total,
+    items_success: summary.items_success,
+    items_failed: summary.items_failed,
+    avg_top10_pct: summary.avg_top10_pct,
+    items_needing_attention: summary.items_needing_attention,
+    items_without_data: summary.items_without_data,
+    items_with_fallback: summary.items_with_fallback,
+    short_signals: shortSignals,
+  };
+}
+
+function toScenarioBlockItem(item: PortfolioInsightItem) {
+  return {
+    project_id: item.project_id,
+    region_index: item.region_index,
+    ok: item.ok,
+    error: item.error,
+    top10_pct: item.top10_pct ?? null,
+    top10_level: item.flags.top10_level,
+    has_fresh_data: item.flags.has_fresh_data,
+    data_staleness_days: item.flags.data_staleness_days,
+    actual_snapshot_date: item.actual_snapshot_date ?? null,
+    attention_reasons: buildAttentionReasons(item),
+  };
+}
+
+function buildAttentionReasons(item: PortfolioInsightItem): string[] {
+  const reasons: string[] = [];
+
+  if (!item.flags.has_data) {
+    reasons.push("no_data");
+  }
+
+  if (!item.flags.has_fresh_data && item.flags.has_data) {
+    reasons.push("stale_data");
+  }
+
+  if (item.flags.top10_level === "critical") {
+    reasons.push("critical_top10");
+  }
+
+  if (item.flags.top10_level === "weak") {
+    reasons.push("weak_top10");
+  }
+
+  return reasons;
+}
+
+function compareProblemProjects(a: PortfolioInsightItem, b: PortfolioInsightItem): number {
+  const aFailed = a.ok === false ? 1 : 0;
+  const bFailed = b.ok === false ? 1 : 0;
+
+  if (aFailed !== bFailed) {
+    return bFailed - aFailed;
+  }
+
+  const levelRank: Record<Top10Level, number> = {
+    critical: 4,
+    weak: 3,
+    normal: 2,
+    strong: 1,
+    unknown: 0,
+  };
+
+  const aRank = levelRank[a.flags.top10_level];
+  const bRank = levelRank[b.flags.top10_level];
+
+  if (aRank !== bRank) {
+    return bRank - aRank;
+  }
+
+  const aStaleness = a.flags.data_staleness_days ?? -1;
+  const bStaleness = b.flags.data_staleness_days ?? -1;
+
+  if (aStaleness !== bStaleness) {
+    return bStaleness - aStaleness;
+  }
+
+  const aTop10 = Number.isFinite(Number(a.top10_pct)) ? Number(a.top10_pct) : Number.POSITIVE_INFINITY;
+  const bTop10 = Number.isFinite(Number(b.top10_pct)) ? Number(b.top10_pct) : Number.POSITIVE_INFINITY;
+
+  return aTop10 - bTop10;
+}
+
+function compareStaleDataProjects(a: PortfolioInsightItem, b: PortfolioInsightItem): number {
+  const aFailed = a.ok === false ? 1 : 0;
+  const bFailed = b.ok === false ? 1 : 0;
+
+  if (aFailed !== bFailed) {
+    return bFailed - aFailed;
+  }
+
+  const aStaleness = a.flags.data_staleness_days ?? -1;
+  const bStaleness = b.flags.data_staleness_days ?? -1;
+
+  if (aStaleness !== bStaleness) {
+    return bStaleness - aStaleness;
+  }
+
+  const aTop10 = Number.isFinite(Number(a.top10_pct)) ? Number(a.top10_pct) : Number.POSITIVE_INFINITY;
+  const bTop10 = Number.isFinite(Number(b.top10_pct)) ? Number(b.top10_pct) : Number.POSITIVE_INFINITY;
+
+  return aTop10 - bTop10;
+}
 function getTopvisorConfig(): TopvisorConfig | null {
   const userId = Deno.env.get("TOPVISOR_USER_ID");
   const apiKey = Deno.env.get("TOPVISOR_API_KEY");
@@ -618,4 +810,14 @@ function normalizeErrorMessage(error: unknown): string {
 
   return String(error || "Unknown error");
 }
+
+
+
+
+
+
+
+
+
+
 
