@@ -12,24 +12,52 @@ const corsHeaders = {
 const DEFAULT_LOOKBACK_DAYS = 14;
 
 type ReportMode = "strict" | "latest_available";
+type Top10Level = "critical" | "weak" | "normal" | "strong" | "unknown";
 
 type SummaryReportBody = {
-  project_id?: number;
-  region_index?: number;
+  project_id?: unknown;
+  region_index?: unknown;
   date?: string;
-  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest";
+  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest" | "portfolio_insights";
   report_mode?: ReportMode;
   projects?: PortfolioProjectInput[];
 };
 
 type PortfolioProjectInput = {
-  project_id?: number;
-  region_index?: number;
+  project_id?: unknown;
+  region_index?: unknown;
 };
 
 type TopvisorConfig = {
   userId: string;
   apiKey: string;
+};
+
+type PortfolioItem = {
+  ok: boolean;
+  project_id: unknown;
+  region_index: unknown;
+  requested_date: string;
+  report_mode?: ReportMode;
+  actual_snapshot_date?: string;
+  fallback_used?: boolean;
+  fallback_days?: number;
+  top10_abs?: number;
+  keywords_all?: number;
+  top10_pct?: number;
+  error?: string;
+};
+
+type PortfolioFlags = {
+  has_data: boolean;
+  has_fresh_data: boolean;
+  needs_attention: boolean;
+  data_staleness_days: number | null;
+  top10_level: Top10Level;
+};
+
+type PortfolioInsightItem = PortfolioItem & {
+  flags: PortfolioFlags;
 };
 
 Deno.serve(async (req: Request) => {
@@ -90,7 +118,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  if (body.mode === "portfolio_latest") {
+  if (body.mode === "portfolio_latest" || body.mode === "portfolio_insights") {
     const validationError = validatePortfolioBody(body);
     if (validationError) {
       return Response.json(
@@ -119,7 +147,9 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const response = await buildPortfolioLatestResponse(config, body);
+    const response = body.mode === "portfolio_insights"
+      ? await buildPortfolioInsightsResponse(config, body)
+      : await buildPortfolioLatestResponse(config, body);
 
     return Response.json(response, {
       status: 200,
@@ -251,7 +281,7 @@ function validateSingleBody(body: SummaryReportBody): string | null {
   }
 
   if (body.mode && !["strict", "latest_available", "mock"].includes(body.mode)) {
-    return "Invalid mode. Expected strict, latest_available, mock, or portfolio_latest";
+    return "Invalid mode. Expected strict, latest_available, mock, portfolio_latest, or portfolio_insights";
   }
 
   return null;
@@ -282,7 +312,7 @@ async function buildPortfolioLatestResponse(config: TopvisorConfig, body: Summar
   const reportMode: ReportMode = body.report_mode || "latest_available";
   const projects = body.projects || [];
 
-  const items = [];
+  const items: PortfolioItem[] = [];
 
   for (const project of projects) {
     const projectId = Number(project.project_id);
@@ -379,6 +409,137 @@ async function buildPortfolioLatestResponse(config: TopvisorConfig, body: Summar
   };
 }
 
+async function buildPortfolioInsightsResponse(config: TopvisorConfig, body: SummaryReportBody) {
+  const latestResponse = await buildPortfolioLatestResponse(config, body);
+  const insightItems = latestResponse.items
+    .map((item) => addPortfolioFlags(item))
+    .sort(compareInsightItems);
+
+  const top10Values = insightItems
+    .filter((item) => item.ok && Number.isFinite(Number(item.top10_pct)))
+    .map((item) => Number(item.top10_pct));
+
+  const avgTop10Pct = top10Values.length > 0
+    ? roundTo(top10Values.reduce((sum, value) => sum + value, 0) / top10Values.length, 4)
+    : null;
+
+  const minTop10Pct = top10Values.length > 0 ? Math.min(...top10Values) : null;
+  const maxTop10Pct = top10Values.length > 0 ? Math.max(...top10Values) : null;
+
+  const itemsSuccess = insightItems.filter((item) => item.ok).length;
+  const itemsFailed = insightItems.length - itemsSuccess;
+  const itemsWithFallback = insightItems.filter((item) => item.ok && item.fallback_used === true).length;
+  const itemsWithoutData = insightItems.filter((item) => !item.flags.has_data).length;
+  const itemsNeedingAttention = insightItems.filter((item) => item.flags.needs_attention).length;
+
+  return {
+    ok: true,
+    service: "ai-seo-analyst",
+    scenario: "portfolio-insights",
+    mode: "portfolio_insights",
+    request: latestResponse.request,
+    summary: {
+      items_total: insightItems.length,
+      items_success: itemsSuccess,
+      items_failed: itemsFailed,
+      avg_top10_pct: avgTop10Pct,
+      min_top10_pct: minTop10Pct,
+      max_top10_pct: maxTop10Pct,
+      items_with_fallback: itemsWithFallback,
+      items_without_data: itemsWithoutData,
+      items_needing_attention: itemsNeedingAttention,
+    },
+    items: insightItems,
+    warnings: [
+      "This is a demo-MVP analytical layer. It identifies signals, not SEO causes.",
+      ...latestResponse.warnings,
+    ],
+  };
+}
+
+function addPortfolioFlags(item: PortfolioItem): PortfolioInsightItem {
+  const hasData = item.ok === true && Number(item.keywords_all) > 0;
+  const dataStalenessDays = hasData
+    ? item.fallback_used === true
+      ? Number(item.fallback_days || 0)
+      : 0
+    : null;
+
+  const hasFreshData = hasData && dataStalenessDays === 0;
+  const top10Level = classifyTop10Level(hasData ? item.top10_pct : null);
+
+  const needsAttention =
+    item.ok === false ||
+    !hasFreshData ||
+    top10Level === "critical" ||
+    top10Level === "weak";
+
+  return {
+    ...item,
+    flags: {
+      has_data: hasData,
+      has_fresh_data: hasFreshData,
+      needs_attention: needsAttention,
+      data_staleness_days: dataStalenessDays,
+      top10_level: top10Level,
+    },
+  };
+}
+
+function classifyTop10Level(value: unknown): Top10Level {
+  if (value === null || value === undefined || value === "") {
+    return "unknown";
+  }
+
+  const top10Pct = Number(value);
+
+  if (!Number.isFinite(top10Pct)) {
+    return "unknown";
+  }
+
+  if (top10Pct < 10) {
+    return "critical";
+  }
+
+  if (top10Pct < 30) {
+    return "weak";
+  }
+
+  if (top10Pct < 60) {
+    return "normal";
+  }
+
+  return "strong";
+}
+
+function compareInsightItems(a: PortfolioInsightItem, b: PortfolioInsightItem): number {
+  const aFailed = a.ok === false ? 1 : 0;
+  const bFailed = b.ok === false ? 1 : 0;
+
+  if (aFailed !== bFailed) {
+    return bFailed - aFailed;
+  }
+
+  const aNeedsAttention = a.flags.needs_attention ? 1 : 0;
+  const bNeedsAttention = b.flags.needs_attention ? 1 : 0;
+
+  if (aNeedsAttention !== bNeedsAttention) {
+    return bNeedsAttention - aNeedsAttention;
+  }
+
+  const aStaleness = a.flags.data_staleness_days ?? -1;
+  const bStaleness = b.flags.data_staleness_days ?? -1;
+
+  if (aStaleness !== bStaleness) {
+    return bStaleness - aStaleness;
+  }
+
+  const aTop10 = Number.isFinite(Number(a.top10_pct)) ? Number(a.top10_pct) : Number.POSITIVE_INFINITY;
+  const bTop10 = Number.isFinite(Number(b.top10_pct)) ? Number(b.top10_pct) : Number.POSITIVE_INFINITY;
+
+  return aTop10 - bTop10;
+}
+
 function getTopvisorConfig(): TopvisorConfig | null {
   const userId = Deno.env.get("TOPVISOR_USER_ID");
   const apiKey = Deno.env.get("TOPVISOR_API_KEY");
@@ -445,6 +606,11 @@ function addDaysYmd(value: string, days: number): string {
   return date.toISOString().slice(0, 10);
 }
 
+function roundTo(value: number, digits: number): number {
+  const factor = Math.pow(10, digits);
+  return Math.round(value * factor) / factor;
+}
+
 function normalizeErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -452,3 +618,4 @@ function normalizeErrorMessage(error: unknown): string {
 
   return String(error || "Unknown error");
 }
+
