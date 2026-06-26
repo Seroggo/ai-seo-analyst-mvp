@@ -1,16 +1,53 @@
-# React + Vite
+# AI SEO Analyst Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Minimal Vite + React frontend for AI SEO Analyst demo MVP.
 
-Currently, two official plugins are available:
+The app calls the Supabase Edge Function `summary-report` and displays a Markdown SEO report.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Local frontend run
 
-## React Compiler
+```bash
+cd frontend
+cp .env.example .env.local
+npm install
+npm run dev
+npm run build
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+On Windows PowerShell, use this instead of `cp`:
 
-## Expanding the ESLint configuration
+```powershell
+Copy-Item .env.example .env.local
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Before running the app, fill `VITE_DEMO_TOKEN` in `.env.local`.
+
+Do not commit `.env.local`.
+
+## Required environment variables
+
+```env
+VITE_SUPABASE_FUNCTION_URL=https://zrbujphgaxhofqmmbqhv.supabase.co/functions/v1/summary-report
+VITE_DEMO_TOKEN=replace-with-demo-token
+```
+
+## Vercel settings
+
+Use these settings when importing the repository into Vercel:
+
+```text
+Root Directory: frontend
+Framework Preset: Vite
+Install Command: npm install
+Build Command: npm run build
+Output Directory: dist
+```
+
+Add these environment variables in Vercel:
+
+```text
+VITE_SUPABASE_FUNCTION_URL
+VITE_DEMO_TOKEN
+```
+
+Do not add TopVisor API key or OpenModel API key to the frontend or Vercel frontend environment.
