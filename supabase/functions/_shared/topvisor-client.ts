@@ -13,6 +13,19 @@ export type TopvisorSummaryMetrics = {
   top10_pct: number;
 };
 
+export type TopvisorProjectRegionMetadata = {
+  region_index: number;
+  region_name: string;
+};
+
+export type TopvisorProjectMetadata = {
+  project_id: number;
+  project_name: string | null;
+  site: string | null;
+  display_name: string;
+  regions: TopvisorProjectRegionMetadata[];
+};
+
 type TopvisorClientConfig = {
   userId: string;
   apiKey: string;
@@ -54,6 +67,50 @@ async function topvisorPost(
   return json;
 }
 
+export async function fetchTopvisorProjects(
+  config: TopvisorClientConfig,
+): Promise<TopvisorProjectMetadata[]> {
+  const response = await topvisorPost(config, "/get/projects_2/projects", {
+    fields: ["id", "name", "site"],
+    show_searchers_and_regions: 1,
+  });
+
+  const result = response.result;
+
+  if (!Array.isArray(result)) {
+    return [];
+  }
+
+  return result
+    .map((project) => normalizeProjectMetadata(project))
+    .filter((project): project is TopvisorProjectMetadata => project !== null);
+}
+
+function normalizeProjectMetadata(project: unknown): TopvisorProjectMetadata | null {
+  if (!project || typeof project !== "object") {
+    return null;
+  }
+
+  const rawProject = project as Record<string, unknown>;
+  const projectId = Number(rawProject.id);
+
+  if (!Number.isFinite(projectId)) {
+    return null;
+  }
+
+  const projectName = toNullableString(rawProject.name);
+  const site = toNullableString(rawProject.site);
+  const displayName = projectName || site || `Project ${projectId}`;
+  const regions = extractProjectRegions(rawProject);
+
+  return {
+    project_id: projectId,
+    project_name: projectName,
+    site,
+    display_name: displayName,
+    regions,
+  };
+}
 export async function fetchTopvisorSummaryForDate(
   config: TopvisorClientConfig,
   request: TopvisorSummaryRequest,
@@ -141,6 +198,67 @@ function sumTopBuckets(topObj: Record<string, unknown>): number {
   );
 }
 
+function extractProjectRegions(project: Record<string, unknown>): TopvisorProjectRegionMetadata[] {
+  const regions = new Map<number, TopvisorProjectRegionMetadata>();
+
+  function visit(value: unknown, keyHint = ""): void {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item, keyHint);
+      }
+      return;
+    }
+
+    const obj = value as Record<string, unknown>;
+    const keyLooksLikeRegion = keyHint.toLowerCase().includes("region");
+
+    if (keyLooksLikeRegion) {
+      const regionIndex = Number(obj.index ?? obj.region_index ?? obj.id);
+      const regionName = toNullableString(obj.name ?? obj.region_name ?? obj.title);
+
+      if (Number.isFinite(regionIndex) && regionName) {
+        regions.set(regionIndex, {
+          region_index: regionIndex,
+          region_name: regionName,
+        });
+      }
+    }
+
+    for (const [key, child] of Object.entries(obj)) {
+      visit(child, key);
+    }
+  }
+
+  visit(project);
+
+  return Array.from(regions.values());
+}
+function toNullableString(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const text = repairMojibake(String(value).trim());
+  return text.length > 0 ? text : null;
+}
+
+function repairMojibake(value: string): string {
+  if (!/[ÐÑ]/.test(value)) {
+    return value;
+  }
+
+  try {
+    const bytes = Uint8Array.from(Array.from(value), (char) => char.charCodeAt(0) & 255);
+    return new TextDecoder("utf-8").decode(bytes);
+  } catch {
+    return value;
+  }
+}
+
 function toIntSafe(value: unknown): number {
   const parsed = parseInt(String(value || ""), 10);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -169,3 +287,12 @@ function extractApiError(json: Record<string, unknown>): string {
 
   return "unknown API error";
 }
+
+
+
+
+
+
+
+
+

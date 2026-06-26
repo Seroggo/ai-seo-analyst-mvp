@@ -1,6 +1,8 @@
 ﻿import {
   extractSummaryMetrics,
+  fetchTopvisorProjects,
   fetchTopvisorSummaryForDate,
+  type TopvisorProjectMetadata,
 } from "../_shared/topvisor-client.ts";
 
 const corsHeaders = {
@@ -36,7 +38,11 @@ type TopvisorConfig = {
 type PortfolioItem = {
   ok: boolean;
   project_id: unknown;
+  project_name?: string | null;
+  site?: string | null;
+  display_name?: string;
   region_index: unknown;
+  region_name?: string;
   requested_date: string;
   report_mode?: ReportMode;
   actual_snapshot_date?: string;
@@ -318,6 +324,8 @@ async function buildPortfolioLatestResponse(config: TopvisorConfig, body: Summar
   const requestedDate = String(body.date);
   const reportMode: ReportMode = body.report_mode || "latest_available";
   const projects = body.projects || [];
+  const metadataLoadResult = await loadProjectMetadataMap(config);
+  const metadataByProjectId = metadataLoadResult.metadataByProjectId;
 
   const items: PortfolioItem[] = [];
 
@@ -383,8 +391,9 @@ async function buildPortfolioLatestResponse(config: TopvisorConfig, body: Summar
     }
   }
 
-  const itemsSuccess = items.filter((item) => item.ok).length;
-  const itemsFailed = items.length - itemsSuccess;
+  const enrichedItems = items.map((item) => addProjectMetadataToItem(item, metadataByProjectId));
+  const itemsSuccess = enrichedItems.filter((item) => item.ok).length;
+  const itemsFailed = enrichedItems.length - itemsSuccess;
 
   const warnings: string[] = [];
 
@@ -394,6 +403,10 @@ async function buildPortfolioLatestResponse(config: TopvisorConfig, body: Summar
 
   if (itemsFailed > 0) {
     warnings.push("Some portfolio items failed. See item-level errors.");
+  }
+
+  if (metadataLoadResult.warning) {
+    warnings.push(metadataLoadResult.warning);
   }
 
   return {
@@ -407,11 +420,11 @@ async function buildPortfolioLatestResponse(config: TopvisorConfig, body: Summar
       projects_count: projects.length,
     },
     summary: {
-      items_total: items.length,
+      items_total: enrichedItems.length,
       items_success: itemsSuccess,
       items_failed: itemsFailed,
     },
-    items,
+    items: enrichedItems,
     warnings,
   };
 }
@@ -468,6 +481,80 @@ async function buildPortfolioInsightsResponse(config: TopvisorConfig, body: Summ
   };
 }
 
+async function loadProjectMetadataMap(config: TopvisorConfig): Promise<{
+  metadataByProjectId: Map<number, TopvisorProjectMetadata>;
+  warning: string | null;
+}> {
+  try {
+    const projects = await fetchTopvisorProjects({
+      userId: config.userId,
+      apiKey: config.apiKey,
+    });
+
+    return {
+      metadataByProjectId: new Map(projects.map((project) => [project.project_id, project])),
+      warning: null,
+    };
+  } catch {
+    return {
+      metadataByProjectId: new Map(),
+      warning: "Project metadata could not be loaded. Using project_id as display name.",
+    };
+  }
+}
+
+function getProjectMetadata(
+  projectId: unknown,
+  metadataByProjectId: Map<number, TopvisorProjectMetadata>,
+): TopvisorProjectMetadata {
+  const numericProjectId = Number(projectId);
+
+  if (Number.isFinite(numericProjectId)) {
+    const metadata = metadataByProjectId.get(numericProjectId);
+
+    if (metadata) {
+      return metadata;
+    }
+  }
+
+  const fallbackProjectId = String(projectId ?? "unknown");
+
+  return {
+    project_id: Number.isFinite(numericProjectId) ? numericProjectId : 0,
+    project_name: null,
+    site: null,
+    display_name: `Project ${fallbackProjectId}`,
+    regions: [],
+  };
+}
+function getRegionName(regionIndex: unknown, metadata: TopvisorProjectMetadata): string {
+  const numericRegionIndex = Number(regionIndex);
+
+  if (Number.isFinite(numericRegionIndex)) {
+    const region = metadata.regions.find((item) => item.region_index === numericRegionIndex);
+
+    if (region) {
+      return region.region_name;
+    }
+  }
+
+  return `Region ${String(regionIndex ?? "unknown")}`;
+}
+
+function addProjectMetadataToItem(
+  item: PortfolioItem,
+  metadataByProjectId: Map<number, TopvisorProjectMetadata>,
+): PortfolioItem {
+  const metadata = getProjectMetadata(item.project_id, metadataByProjectId);
+
+  return {
+    ...item,
+    project_name: metadata.project_name,
+    site: metadata.site,
+    display_name: metadata.display_name,
+    region_name: getRegionName(item.region_index, metadata),
+  };
+}
 function addPortfolioFlags(item: PortfolioItem): PortfolioInsightItem {
   const hasData = item.ok === true && Number(item.keywords_all) > 0;
   const dataStalenessDays = hasData
@@ -642,7 +729,11 @@ function buildPortfolioHealthSummary(items: PortfolioInsightItem[], summary: {
 function toScenarioBlockItem(item: PortfolioInsightItem) {
   return {
     project_id: item.project_id,
+    project_name: item.project_name ?? null,
+    site: item.site ?? null,
+    display_name: item.display_name ?? `Project ${String(item.project_id ?? "unknown")}`,
     region_index: item.region_index,
+    region_name: item.region_name ?? `Region ${String(item.region_index ?? "unknown")}`,
     ok: item.ok,
     error: item.error,
     top10_pct: item.top10_pct ?? null,
@@ -810,6 +901,18 @@ function normalizeErrorMessage(error: unknown): string {
 
   return String(error || "Unknown error");
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
