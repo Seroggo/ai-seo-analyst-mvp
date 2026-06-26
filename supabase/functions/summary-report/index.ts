@@ -4,6 +4,7 @@
   fetchTopvisorSummaryForDate,
   type TopvisorProjectMetadata,
 } from "../_shared/topvisor-client.ts";
+import { buildPortfolioMarkdownReport } from "../_shared/report-writer.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -20,7 +21,7 @@ type SummaryReportBody = {
   project_id?: unknown;
   region_index?: unknown;
   date?: string;
-  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest" | "portfolio_insights";
+  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest" | "portfolio_insights" | "portfolio_report";
   report_mode?: ReportMode;
   projects?: PortfolioProjectInput[];
 };
@@ -124,7 +125,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  if (body.mode === "portfolio_latest" || body.mode === "portfolio_insights") {
+  if (body.mode === "portfolio_latest" || body.mode === "portfolio_insights" || body.mode === "portfolio_report") {
     const validationError = validatePortfolioBody(body);
     if (validationError) {
       return Response.json(
@@ -153,9 +154,17 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const response = body.mode === "portfolio_insights"
-      ? await buildPortfolioInsightsResponse(config, body)
-      : await buildPortfolioLatestResponse(config, body);
+    let response;
+
+    try {
+      response = body.mode === "portfolio_report"
+        ? await buildPortfolioReportResponse(config, body)
+        : body.mode === "portfolio_insights"
+          ? await buildPortfolioInsightsResponse(config, body)
+          : await buildPortfolioLatestResponse(config, body);
+    } catch (error) {
+      return Response.json({ ok: false, error: normalizeErrorMessage(error) }, { status: 500, headers: corsHeaders });
+    }
 
     const responseBody = JSON.stringify(response);
 
@@ -294,7 +303,7 @@ function validateSingleBody(body: SummaryReportBody): string | null {
   }
 
   if (body.mode && !["strict", "latest_available", "mock"].includes(body.mode)) {
-    return "Invalid mode. Expected strict, latest_available, mock, portfolio_latest, or portfolio_insights";
+    return "Invalid mode. Expected strict, latest_available, mock, portfolio_latest, portfolio_insights, or portfolio_report";
   }
 
   return null;
@@ -318,6 +327,29 @@ function validatePortfolioBody(body: SummaryReportBody): string | null {
   }
 
   return null;
+}
+
+async function buildPortfolioReportResponse(config: TopvisorConfig, body: SummaryReportBody) {
+  const insightsResponse = await buildPortfolioInsightsResponse(config, body);
+
+  const reportResult = await buildPortfolioMarkdownReport({
+    request: insightsResponse.request,
+    summary: insightsResponse.summary,
+    scenario_blocks: insightsResponse.scenario_blocks,
+    warnings: insightsResponse.warnings,
+  });
+
+  return {
+    ok: true,
+    service: "ai-seo-analyst",
+    scenario: "portfolio-report",
+    mode: "portfolio_report",
+    request: insightsResponse.request,
+    summary: insightsResponse.summary,
+    report: reportResult.report,
+    llm: reportResult.llm,
+    warnings: reportResult.warnings,
+  };
 }
 
 async function buildPortfolioLatestResponse(config: TopvisorConfig, body: SummaryReportBody) {
@@ -901,6 +933,12 @@ function normalizeErrorMessage(error: unknown): string {
 
   return String(error || "Unknown error");
 }
+
+
+
+
+
+
 
 
 
