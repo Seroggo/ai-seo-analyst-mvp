@@ -5,6 +5,7 @@
   type TopvisorProjectMetadata,
 } from "../_shared/topvisor-client.ts";
 import { buildPortfolioMarkdownReport } from "../_shared/report-writer.ts";
+import { readTopvisorScopeCache, writeTopvisorScopeCache, type ScopeCacheStatus } from "../_shared/scope-cache.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -15,14 +16,19 @@ const corsHeaders = {
 const DEFAULT_LOOKBACK_DAYS = 14;
 
 type ReportMode = "strict" | "latest_available";
+type ReportFocus = "overview" | "problem_projects" | "stale_data_projects" | "critical_top10_projects" | "attention_queue";
 type Top10Level = "critical" | "weak" | "normal" | "strong" | "unknown";
 
 type SummaryReportBody = {
   project_id?: unknown;
   region_index?: unknown;
   date?: string;
-  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest" | "portfolio_insights" | "portfolio_report";
+  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest" | "portfolio_insights" | "portfolio_report" | "portfolio_report_auto" | "portfolio_snapshot_build";
   report_mode?: ReportMode;
+  report_focus?: unknown;
+  force_refresh_scope?: unknown;
+  batch_size?: unknown;
+  cursor?: unknown;
   projects?: PortfolioProjectInput[];
 };
 
@@ -65,6 +71,34 @@ type PortfolioFlags = {
 
 type PortfolioInsightItem = PortfolioItem & {
   flags: PortfolioFlags;
+};
+
+type PortfolioScopeCacheState = {
+  enabled: boolean;
+  status: ScopeCacheStatus;
+  cache_key: string;
+  cache_date: string;
+  expires_at: string | null;
+};
+
+type PortfolioGroupItem = {
+  project_id: unknown;
+  display_name: string;
+  site?: string | null;
+  region_index: unknown;
+  region_name?: string;
+  top10_pct?: number | null;
+  actual_snapshot_date?: string | null;
+  fallback_used?: boolean;
+  fallback_days?: number | null;
+};
+
+type PortfolioGroups = {
+  top10_above_50: PortfolioGroupItem[];
+  top10_20_50: PortfolioGroupItem[];
+  top10_10_20: PortfolioGroupItem[];
+  top10_below_10: PortfolioGroupItem[];
+  stale_or_missing_data: PortfolioGroupItem[];
 };
 
 Deno.serve(async (req: Request) => {
@@ -125,7 +159,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  if (body.mode === "portfolio_latest" || body.mode === "portfolio_insights" || body.mode === "portfolio_report") {
+  if (body.mode === "portfolio_latest" || body.mode === "portfolio_insights" || body.mode === "portfolio_report" || body.mode === "portfolio_report_auto" || body.mode === "portfolio_snapshot_build") {
     const validationError = validatePortfolioBody(body);
     if (validationError) {
       return Response.json(
@@ -157,11 +191,15 @@ Deno.serve(async (req: Request) => {
     let response;
 
     try {
-      response = body.mode === "portfolio_report"
-        ? await buildPortfolioReportResponse(config, body)
-        : body.mode === "portfolio_insights"
-          ? await buildPortfolioInsightsResponse(config, body)
-          : await buildPortfolioLatestResponse(config, body);
+      response = body.mode === "portfolio_snapshot_build"
+        ? await buildPortfolioSnapshotBuildResponse(config, body)
+        : body.mode === "portfolio_report_auto"
+          ? await buildPortfolioAutoReportResponse(config, body)
+          : body.mode === "portfolio_report"
+            ? await buildPortfolioReportResponse(config, body)
+            : body.mode === "portfolio_insights"
+              ? await buildPortfolioInsightsResponse(config, body)
+              : await buildPortfolioLatestResponse(config, body);
     } catch (error) {
       return Response.json({ ok: false, error: normalizeErrorMessage(error) }, { status: 500, headers: corsHeaders });
     }
@@ -303,7 +341,7 @@ function validateSingleBody(body: SummaryReportBody): string | null {
   }
 
   if (body.mode && !["strict", "latest_available", "mock"].includes(body.mode)) {
-    return "Invalid mode. Expected strict, latest_available, mock, portfolio_latest, portfolio_insights, or portfolio_report";
+    return "Invalid mode. Expected strict, latest_available, mock, portfolio_latest, portfolio_insights, portfolio_report, portfolio_report_auto, or portfolio_snapshot_build";
   }
 
   return null;
@@ -318,6 +356,10 @@ function validatePortfolioBody(body: SummaryReportBody): string | null {
     return "Invalid report_mode. Expected strict or latest_available";
   }
 
+  if (body.mode === "portfolio_report_auto" || body.mode === "portfolio_snapshot_build") {
+    return null;
+  }
+
   if (!Array.isArray(body.projects)) {
     return "Missing or invalid projects. Expected array";
   }
@@ -329,22 +371,344 @@ function validatePortfolioBody(body: SummaryReportBody): string | null {
   return null;
 }
 
+export function normalizeReportFocus(value: unknown): ReportFocus {
+  if (value === "problem_projects" || value === "stale_data_projects" || value === "critical_top10_projects" || value === "attention_queue") {
+    return value;
+  }
+
+  return "overview";
+}
+
+export function buildAutoPortfolioProjects(projects: TopvisorProjectMetadata[]) {
+  const generatedProjects: PortfolioProjectInput[] = [];
+  let skippedProjectsCount = 0;
+  const warnings: string[] = [];
+
+  for (const project of projects) {
+    const usableRegions = (project.regions || []).filter((region) => Number.isFinite(Number(region.region_index)) && !!region.region_name);
+
+    if (usableRegions.length === 0) {
+      skippedProjectsCount += 1;
+      continue;
+    }
+
+    for (const region of usableRegions) {
+      generatedProjects.push({
+        project_id: project.project_id,
+        region_index: region.region_index,
+      });
+    }
+  }
+
+  if (skippedProjectsCount > 0) {
+    warnings.push(`Skipped ${skippedProjectsCount} project(s) without usable region metadata.`);
+  }
+
+  if (generatedProjects.length === 0) {
+    warnings.push("No usable project-region pairs were generated from Topvisor metadata.");
+  }
+
+  return {
+    projects: generatedProjects,
+    skippedProjectsCount,
+    warnings,
+    projectsCount: projects.length,
+  };
+}
+
+async function buildPortfolioAutoReportResponse(config: TopvisorConfig, body: SummaryReportBody) {
+  const requestedDate = String(body.date);
+  const reportMode: ReportMode = body.report_mode || "latest_available";
+  const reportFocus = normalizeReportFocus(body.report_focus);
+  const snapshotCacheKey = `daily_portfolio_snapshot:${requestedDate}:${reportMode}`;
+  const snapshotCacheDate = requestedDate;
+
+  const snapshotCacheResult = await readTopvisorScopeCache({
+    cacheKey: snapshotCacheKey,
+    cacheDate: snapshotCacheDate,
+  });
+
+  if (snapshotCacheResult.entry && snapshotCacheResult.available) {
+    const snapshotPayload = snapshotCacheResult.entry.payload as Record<string, unknown>;
+    const reportPayload = {
+      request: {
+        requested_date: requestedDate,
+        report_mode: reportMode,
+        report_focus: reportFocus,
+        projects_count: Number(snapshotPayload.scope_metadata?.project_region_pairs_total ?? 0),
+      },
+      summary: snapshotPayload.summary,
+      scenario_blocks: snapshotPayload.scenario_blocks,
+      portfolio_groups: snapshotPayload.portfolio_groups,
+      warnings: snapshotPayload.warnings,
+      scope_metadata: snapshotPayload.scope_metadata,
+    };
+    const reportResult = await buildPortfolioMarkdownReport(reportPayload, reportFocus);
+
+    return {
+      ok: true,
+      service: "ai-seo-analyst",
+      scenario: "portfolio-report-auto",
+      mode: "portfolio_report_auto",
+      report_focus: reportFocus,
+      report_source: "cached_snapshot",
+      snapshot_cache: {
+        enabled: true,
+        status: "hit" as ScopeCacheStatus,
+        cache_key: snapshotCacheKey,
+        cache_date: snapshotCacheDate,
+        expires_at: snapshotCacheResult.entry.expires_at,
+      },
+      scope_cache: {
+        enabled: true,
+        status: (snapshotPayload.scope_metadata?.scope_cache_status as ScopeCacheStatus) || "unavailable_live_fallback",
+        cache_key: (snapshotPayload.scope_metadata?.scope_cache_key as string) || "daily_project_scope",
+        cache_date: (snapshotPayload.scope_metadata?.scope_cache_date as string) || requestedDate,
+        expires_at: (snapshotPayload.scope_metadata?.scope_cache_expires_at as string) || null,
+      },
+      request: reportPayload.request,
+      summary: snapshotPayload.summary,
+      report: reportResult.report,
+      llm: reportResult.llm,
+      warnings: reportResult.warnings,
+      auto_scope: {
+        source: "daily_project_scope",
+        projects_total: Number(snapshotPayload.scope_metadata?.projects_total ?? 0),
+        project_region_pairs_total: Number(snapshotPayload.scope_metadata?.project_region_pairs_total ?? 0),
+        project_region_pairs_processed: Number(snapshotPayload.scope_metadata?.project_region_pairs_processed ?? 0),
+        items_success: Number(snapshotPayload.summary?.items_success ?? 0),
+        items_failed: Number(snapshotPayload.summary?.items_failed ?? 0),
+        items_without_data: Number(snapshotPayload.summary?.items_without_data ?? 0),
+      },
+      portfolio_groups: snapshotPayload.portfolio_groups,
+    };
+  }
+
+  const buildCacheKey = `daily_portfolio_snapshot_build:${requestedDate}:${reportMode}`;
+  const buildCacheResult = await readTopvisorScopeCache({
+    cacheKey: buildCacheKey,
+    cacheDate: snapshotCacheDate,
+  });
+  const partialState = buildCacheResult.entry?.payload as Record<string, unknown> | undefined;
+  const progress = partialState ? {
+    processed: Number(partialState.processed ?? 0),
+    total: Number(partialState.total ?? 0),
+    cursor: Number(partialState.cursor ?? 0),
+    next_cursor: partialState.done ? null : Number(partialState.cursor ?? 0),
+    done: Boolean(partialState.done),
+  } : null;
+
+  return {
+    ok: true,
+    mode: "portfolio_report_auto",
+    status: "snapshot_not_ready",
+    next_action: "run portfolio_snapshot_build",
+    report_focus: reportFocus,
+    snapshot_cache: {
+      enabled: true,
+      status: "miss",
+      cache_key: snapshotCacheKey,
+      cache_date: snapshotCacheDate,
+      expires_at: null,
+    },
+    build_payload_example: {
+      mode: "portfolio_snapshot_build",
+      date: requestedDate,
+      report_mode: reportMode,
+      batch_size: 5,
+      cursor: 0,
+      force_refresh_scope: false,
+    },
+    ...(progress ? { build_progress: progress } : {}),
+  };
+}
+
+async function buildPortfolioSnapshotBuildResponse(config: TopvisorConfig, body: SummaryReportBody) {
+  const requestedDate = String(body.date);
+  const reportMode: ReportMode = body.report_mode || "latest_available";
+  const reportFocus = normalizeReportFocus(body.report_focus);
+  const forceRefreshScope = Boolean(body.force_refresh_scope);
+  const batchSize = clampBatchSize(body.batch_size);
+  const cursor = normalizeCursor(body.cursor);
+  const snapshotCacheKey = `daily_portfolio_snapshot:${requestedDate}:${reportMode}`;
+  const buildCacheKey = `daily_portfolio_snapshot_build:${requestedDate}:${reportMode}`;
+  const cacheDate = requestedDate;
+
+  const scopeCacheResult = await getDailyProjectScope(config, { forceRefresh: forceRefreshScope });
+  const autoPortfolioProjects = buildAutoPortfolioProjects(scopeCacheResult.projects);
+  const total = autoPortfolioProjects.projects.length;
+  const start = Math.min(cursor, total);
+  const end = Math.min(total, start + batchSize);
+  const batchProjects = autoPortfolioProjects.projects.slice(start, end);
+
+  let mergedItems: PortfolioInsightItem[] = [];
+  let mergedWarnings: string[] = [];
+  let processed = 0;
+  let done = total === 0;
+  let partialState = undefined as Record<string, unknown> | undefined;
+  const shouldResetBuildState = forceRefreshScope && cursor === 0;
+
+  const buildCacheResult = await readTopvisorScopeCache({
+    cacheKey: buildCacheKey,
+    cacheDate,
+  });
+
+  if (buildCacheResult.entry && buildCacheResult.available && !shouldResetBuildState) {
+    partialState = buildCacheResult.entry.payload as Record<string, unknown>;
+    mergedItems = Array.isArray(partialState.items) ? partialState.items as PortfolioInsightItem[] : [];
+    mergedWarnings = Array.isArray(partialState.warnings) ? partialState.warnings as string[] : [];
+    processed = Number(partialState.processed ?? 0);
+    done = Boolean(partialState.done);
+  }
+
+  if (batchProjects.length > 0 && !done) {
+    const batchBody: SummaryReportBody = {
+      ...body,
+      projects: batchProjects,
+    };
+    const batchInsights = await buildPortfolioInsightsResponse(config, batchBody);
+    mergedItems = [...mergedItems, ...batchInsights.items];
+    mergedWarnings = [...mergedWarnings, ...batchInsights.warnings];
+    processed = Math.max(processed, end);
+    done = end >= total;
+  } else if (!done && total === 0) {
+    done = true;
+  }
+
+  const nextCursor = done ? total : end;
+  const finalScopeMetadata = {
+    scope_cache_status: scopeCacheResult.status,
+    scope_cache_key: scopeCacheResult.cacheKey,
+    scope_cache_date: scopeCacheResult.cacheDate,
+    scope_cache_expires_at: scopeCacheResult.expiresAt,
+    projects_total: autoPortfolioProjects.projectsCount,
+    project_region_pairs_total: autoPortfolioProjects.projects.length,
+    project_region_pairs_processed: processed,
+    items_success: 0,
+    items_failed: 0,
+    items_without_data: 0,
+  };
+
+  const partialPayload = {
+    items: mergedItems,
+    warnings: mergedWarnings,
+    cursor: nextCursor,
+    processed,
+    total,
+    done,
+    scope_metadata: finalScopeMetadata,
+  };
+
+  await writeTopvisorScopeCache({
+    cacheKey: buildCacheKey,
+    cacheDate,
+    payload: partialPayload,
+  });
+
+  if (done) {
+    const finalItems = mergedItems.map((item) => addPortfolioFlags(item));
+    const finalSummary = buildPortfolioInsightsSummary(finalItems);
+    const finalPayload = {
+      items: finalItems,
+      summary: finalSummary,
+      scenario_blocks: buildScenarioBlocks(finalItems, finalSummary),
+      portfolio_groups: buildPortfolioGroups(finalItems),
+      warnings: mergedWarnings,
+      scope_metadata: {
+        ...finalScopeMetadata,
+        items_success: finalSummary.items_success,
+        items_failed: finalSummary.items_failed,
+        items_without_data: finalSummary.items_without_data,
+      },
+    };
+
+    await writeTopvisorScopeCache({
+      cacheKey: snapshotCacheKey,
+      cacheDate,
+      payload: finalPayload,
+    });
+
+    return {
+      ok: true,
+      mode: "portfolio_snapshot_build",
+      status: "snapshot_ready",
+      report_focus: reportFocus,
+      processed,
+      total,
+      cursor: start,
+      next_cursor: null,
+      done: true,
+      batch_size: batchSize,
+      batch_processed: batchProjects.length,
+      snapshot_cache: {
+        enabled: true,
+        status: "miss_refreshed",
+        cache_key: snapshotCacheKey,
+        cache_date: cacheDate,
+        expires_at: null,
+      },
+      scope_cache: {
+        enabled: true,
+        status: scopeCacheResult.status,
+        cache_key: scopeCacheResult.cacheKey,
+        cache_date: scopeCacheResult.cacheDate,
+        expires_at: scopeCacheResult.expiresAt,
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    mode: "portfolio_snapshot_build",
+    status: "snapshot_building",
+    report_focus: reportFocus,
+    processed,
+    total,
+    cursor: start,
+    next_cursor: nextCursor,
+    done: false,
+    batch_size: batchSize,
+    batch_processed: batchProjects.length,
+    snapshot_cache: {
+      enabled: true,
+      status: "miss",
+      cache_key: buildCacheKey,
+      cache_date: cacheDate,
+      expires_at: null,
+    },
+    scope_cache: {
+      enabled: true,
+      status: scopeCacheResult.status,
+      cache_key: scopeCacheResult.cacheKey,
+      cache_date: scopeCacheResult.cacheDate,
+      expires_at: scopeCacheResult.expiresAt,
+    },
+  };
+}
+
 async function buildPortfolioReportResponse(config: TopvisorConfig, body: SummaryReportBody) {
+  const reportFocus = normalizeReportFocus(body.report_focus);
   const insightsResponse = await buildPortfolioInsightsResponse(config, body);
 
   const reportResult = await buildPortfolioMarkdownReport({
-    request: insightsResponse.request,
+    request: {
+      ...insightsResponse.request,
+      report_focus: reportFocus,
+    },
     summary: insightsResponse.summary,
     scenario_blocks: insightsResponse.scenario_blocks,
     warnings: insightsResponse.warnings,
-  });
+  }, reportFocus);
 
   return {
     ok: true,
     service: "ai-seo-analyst",
     scenario: "portfolio-report",
     mode: "portfolio_report",
-    request: insightsResponse.request,
+    request: {
+      ...insightsResponse.request,
+      report_focus: reportFocus,
+    },
     summary: insightsResponse.summary,
     report: reportResult.report,
     llm: reportResult.llm,
@@ -467,34 +831,7 @@ async function buildPortfolioInsightsResponse(config: TopvisorConfig, body: Summ
     .map((item) => addPortfolioFlags(item))
     .sort(compareInsightItems);
 
-  const top10Values = insightItems
-    .filter((item) => item.ok && Number.isFinite(Number(item.top10_pct)))
-    .map((item) => Number(item.top10_pct));
-
-  const avgTop10Pct = top10Values.length > 0
-    ? roundTo(top10Values.reduce((sum, value) => sum + value, 0) / top10Values.length, 4)
-    : null;
-
-  const minTop10Pct = top10Values.length > 0 ? Math.min(...top10Values) : null;
-  const maxTop10Pct = top10Values.length > 0 ? Math.max(...top10Values) : null;
-
-  const itemsSuccess = insightItems.filter((item) => item.ok).length;
-  const itemsFailed = insightItems.length - itemsSuccess;
-  const itemsWithFallback = insightItems.filter((item) => item.ok && item.fallback_used === true).length;
-  const itemsWithoutData = insightItems.filter((item) => !item.flags.has_data).length;
-  const itemsNeedingAttention = insightItems.filter((item) => item.flags.needs_attention).length;
-
-  const insightsSummary = {
-    items_total: insightItems.length,
-    items_success: itemsSuccess,
-    items_failed: itemsFailed,
-    avg_top10_pct: avgTop10Pct,
-    min_top10_pct: minTop10Pct,
-    max_top10_pct: maxTop10Pct,
-    items_with_fallback: itemsWithFallback,
-    items_without_data: itemsWithoutData,
-    items_needing_attention: itemsNeedingAttention,
-  };
+  const insightsSummary = buildPortfolioInsightsSummary(insightItems);
 
   return {
     ok: true,
@@ -533,6 +870,50 @@ async function loadProjectMetadataMap(config: TopvisorConfig): Promise<{
       warning: "Project metadata could not be loaded. Using project_id as display name.",
     };
   }
+}
+
+async function getDailyProjectScope(config: TopvisorConfig, options: { forceRefresh?: boolean }) {
+  const cacheDate = new Date().toISOString().slice(0, 10);
+  const cacheKey = "daily_project_scope";
+  const forceRefresh = Boolean(options.forceRefresh);
+
+  if (!forceRefresh) {
+    const cacheResult = await readTopvisorScopeCache({ cacheKey, cacheDate });
+    if (cacheResult.entry && cacheResult.available) {
+      const payload = cacheResult.entry.payload as { projects?: TopvisorProjectMetadata[] };
+      return {
+        projects: Array.isArray(payload.projects) ? payload.projects : [],
+        status: "hit" as ScopeCacheStatus,
+        cacheKey,
+        cacheDate,
+        expiresAt: cacheResult.entry.expires_at,
+        warnings: cacheResult.warning ? [cacheResult.warning] : [],
+      };
+    }
+  }
+
+  const metadataLoadResult = await loadProjectMetadataMap(config);
+  const projects = Array.from(metadataLoadResult.metadataByProjectId.values());
+  const normalizedProjects = projects.map((project) => ({
+    ...project,
+    regions: (project.regions || []).filter((region) => Number.isFinite(Number(region.region_index)) && !!region.region_name),
+  }));
+  const payload = { projects: normalizedProjects };
+
+  const writeResult = await writeTopvisorScopeCache({ cacheKey, cacheDate, payload });
+  const warnings = [
+    ...(metadataLoadResult.warning ? [metadataLoadResult.warning] : []),
+    ...(writeResult.warning ? [writeResult.warning] : []),
+  ];
+
+  return {
+    projects: normalizedProjects,
+    status: writeResult.ok ? "miss_refreshed" as ScopeCacheStatus : "unavailable_live_fallback",
+    cacheKey,
+    cacheDate,
+    expiresAt: writeResult.expiresAt,
+    warnings,
+  };
 }
 
 function getProjectMetadata(
@@ -668,6 +1049,37 @@ function compareInsightItems(a: PortfolioInsightItem, b: PortfolioInsightItem): 
   const bTop10 = Number.isFinite(Number(b.top10_pct)) ? Number(b.top10_pct) : Number.POSITIVE_INFINITY;
 
   return aTop10 - bTop10;
+}
+
+function buildPortfolioInsightsSummary(items: PortfolioInsightItem[]) {
+  const top10Values = items
+    .filter((item) => item.ok && Number.isFinite(Number(item.top10_pct)))
+    .map((item) => Number(item.top10_pct));
+
+  const avgTop10Pct = top10Values.length > 0
+    ? roundTo(top10Values.reduce((sum, value) => sum + value, 0) / top10Values.length, 4)
+    : null;
+
+  const minTop10Pct = top10Values.length > 0 ? Math.min(...top10Values) : null;
+  const maxTop10Pct = top10Values.length > 0 ? Math.max(...top10Values) : null;
+
+  const itemsSuccess = items.filter((item) => item.ok).length;
+  const itemsFailed = items.length - itemsSuccess;
+  const itemsWithFallback = items.filter((item) => item.ok && item.fallback_used === true).length;
+  const itemsWithoutData = items.filter((item) => !item.flags.has_data).length;
+  const itemsNeedingAttention = items.filter((item) => item.flags.needs_attention).length;
+
+  return {
+    items_total: items.length,
+    items_success: itemsSuccess,
+    items_failed: itemsFailed,
+    avg_top10_pct: avgTop10Pct,
+    min_top10_pct: minTop10Pct,
+    max_top10_pct: maxTop10Pct,
+    items_with_fallback: itemsWithFallback,
+    items_without_data: itemsWithoutData,
+    items_needing_attention: itemsNeedingAttention,
+  };
 }
 
 function buildScenarioBlocks(items: PortfolioInsightItem[], summary: {
@@ -855,6 +1267,51 @@ function compareStaleDataProjects(a: PortfolioInsightItem, b: PortfolioInsightIt
 
   return aTop10 - bTop10;
 }
+
+function buildPortfolioGroups(items: PortfolioInsightItem[]): PortfolioGroups {
+  const groups: PortfolioGroups = {
+    top10_above_50: [],
+    top10_20_50: [],
+    top10_10_20: [],
+    top10_below_10: [],
+    stale_or_missing_data: [],
+  };
+
+  for (const item of items) {
+    if (!item.ok || !Number.isFinite(Number(item.top10_pct)) || !item.flags.has_data) {
+      groups.stale_or_missing_data.push(toPortfolioGroupItem(item));
+      continue;
+    }
+
+    const top10Pct = Number(item.top10_pct);
+    if (top10Pct >= 50) {
+      groups.top10_above_50.push(toPortfolioGroupItem(item));
+    } else if (top10Pct >= 20) {
+      groups.top10_20_50.push(toPortfolioGroupItem(item));
+    } else if (top10Pct >= 10) {
+      groups.top10_10_20.push(toPortfolioGroupItem(item));
+    } else {
+      groups.top10_below_10.push(toPortfolioGroupItem(item));
+    }
+  }
+
+  return groups;
+}
+
+function toPortfolioGroupItem(item: PortfolioInsightItem): PortfolioGroupItem {
+  return {
+    project_id: item.project_id,
+    display_name: item.display_name ?? `Project ${String(item.project_id ?? "unknown")}`,
+    site: item.site ?? null,
+    region_index: item.region_index,
+    region_name: item.region_name ?? `Region ${String(item.region_index ?? "unknown")}`,
+    top10_pct: Number.isFinite(Number(item.top10_pct)) ? Number(item.top10_pct) : null,
+    actual_snapshot_date: item.actual_snapshot_date ?? null,
+    fallback_used: item.fallback_used ?? false,
+    fallback_days: item.fallback_days ?? null,
+  };
+}
+
 function getTopvisorConfig(): TopvisorConfig | null {
   const userId = Deno.env.get("TOPVISOR_USER_ID");
   const apiKey = Deno.env.get("TOPVISOR_API_KEY");
@@ -919,6 +1376,24 @@ function addDaysYmd(value: string, days: number): string {
   const date = new Date(`${value}T00:00:00Z`);
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
+}
+
+function clampBatchSize(value: unknown): number {
+  const numericValue = Number(value ?? 5);
+  if (!Number.isFinite(numericValue)) {
+    return 5;
+  }
+
+  return Math.min(10, Math.max(1, Math.round(numericValue)));
+}
+
+function normalizeCursor(value: unknown): number {
+  const numericValue = Number(value ?? 0);
+  if (!Number.isFinite(numericValue)) {
+    return 0;
+  }
+
+  return Math.max(0, Math.round(numericValue));
 }
 
 function roundTo(value: number, digits: number): number {

@@ -8,6 +8,7 @@ type PortfolioInsightsForReport = {
   };
   summary?: unknown;
   scenario_blocks?: unknown;
+  portfolio_groups?: unknown;
   warnings?: string[];
 };
 
@@ -26,6 +27,7 @@ type PortfolioMarkdownReportResult = {
 
 export async function buildPortfolioMarkdownReport(
   portfolioInsights: PortfolioInsightsForReport,
+  reportFocus: string = "overview",
 ): Promise<PortfolioMarkdownReportResult> {
   const config = getOpenModelConfig();
 
@@ -33,7 +35,7 @@ export async function buildPortfolioMarkdownReport(
     throw new Error("OpenModel credentials are not configured");
   }
 
-  const prompt = buildPortfolioReportPrompt(portfolioInsights);
+  const prompt = buildPortfolioReportPrompt(portfolioInsights, reportFocus);
   const content = await generateLlmText({
     prompt,
     maxTokens: 1800,
@@ -53,11 +55,12 @@ export async function buildPortfolioMarkdownReport(
   };
 }
 
-function buildPortfolioReportPrompt(portfolioInsights: PortfolioInsightsForReport): string {
+function buildPortfolioReportPrompt(portfolioInsights: PortfolioInsightsForReport, reportFocus: string): string {
   const reportPayload = {
     request: portfolioInsights.request ?? null,
     summary: portfolioInsights.summary ?? null,
     scenario_blocks: portfolioInsights.scenario_blocks ?? null,
+    portfolio_groups: portfolioInsights.portfolio_groups ?? null,
     warnings: portfolioInsights.warnings ?? [],
   };
 
@@ -186,6 +189,8 @@ scenario_blocks — это не сырой TopVisor response, а уже обра
 В каждом списке используй короткие пункты. Не растягивай отчёт без необходимости.
 
 ## 9. Структура Markdown-отчёта
+
+Текущий report_focus: ${reportFocus}
 
 Структура строго такая:
 
