@@ -15,3 +15,6 @@ node_modules/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local test data / client exports
+local-data/
