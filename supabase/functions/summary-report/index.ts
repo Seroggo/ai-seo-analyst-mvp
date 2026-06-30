@@ -23,7 +23,7 @@ type SummaryReportBody = {
   project_id?: unknown;
   region_index?: unknown;
   date?: string;
-  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest" | "portfolio_insights" | "portfolio_report" | "portfolio_report_auto" | "portfolio_snapshot_build";
+  mode?: "mock" | "strict" | "latest_available" | "portfolio_latest" | "portfolio_insights" | "portfolio_report" | "portfolio_report_auto" | "portfolio_snapshot_build" | "portfolio_scope_debug";
   report_mode?: ReportMode;
   report_focus?: unknown;
   force_refresh_scope?: unknown;
@@ -159,7 +159,7 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  if (body.mode === "portfolio_latest" || body.mode === "portfolio_insights" || body.mode === "portfolio_report" || body.mode === "portfolio_report_auto" || body.mode === "portfolio_snapshot_build") {
+  if (body.mode === "portfolio_latest" || body.mode === "portfolio_insights" || body.mode === "portfolio_report" || body.mode === "portfolio_report_auto" || body.mode === "portfolio_snapshot_build" || body.mode === "portfolio_scope_debug") {
     const validationError = validatePortfolioBody(body);
     if (validationError) {
       return Response.json(
@@ -191,15 +191,17 @@ Deno.serve(async (req: Request) => {
     let response;
 
     try {
-      response = body.mode === "portfolio_snapshot_build"
-        ? await buildPortfolioSnapshotBuildResponse(config, body)
-        : body.mode === "portfolio_report_auto"
-          ? await buildPortfolioAutoReportResponse(config, body)
-          : body.mode === "portfolio_report"
-            ? await buildPortfolioReportResponse(config, body)
-            : body.mode === "portfolio_insights"
-              ? await buildPortfolioInsightsResponse(config, body)
-              : await buildPortfolioLatestResponse(config, body);
+      response = body.mode === "portfolio_scope_debug"
+        ? await buildPortfolioScopeDebugResponse(config, body)
+        : body.mode === "portfolio_snapshot_build"
+          ? await buildPortfolioSnapshotBuildResponse(config, body)
+          : body.mode === "portfolio_report_auto"
+            ? await buildPortfolioAutoReportResponse(config, body)
+            : body.mode === "portfolio_report"
+              ? await buildPortfolioReportResponse(config, body)
+              : body.mode === "portfolio_insights"
+                ? await buildPortfolioInsightsResponse(config, body)
+                : await buildPortfolioLatestResponse(config, body);
     } catch (error) {
       return Response.json({ ok: false, error: normalizeErrorMessage(error) }, { status: 500, headers: corsHeaders });
     }
@@ -341,7 +343,7 @@ function validateSingleBody(body: SummaryReportBody): string | null {
   }
 
   if (body.mode && !["strict", "latest_available", "mock"].includes(body.mode)) {
-    return "Invalid mode. Expected strict, latest_available, mock, portfolio_latest, portfolio_insights, portfolio_report, portfolio_report_auto, or portfolio_snapshot_build";
+    return "Invalid mode. Expected strict, latest_available, mock, portfolio_latest, portfolio_insights, portfolio_report, portfolio_report_auto, portfolio_snapshot_build, or portfolio_scope_debug";
   }
 
   return null;
@@ -356,7 +358,7 @@ function validatePortfolioBody(body: SummaryReportBody): string | null {
     return "Invalid report_mode. Expected strict or latest_available";
   }
 
-  if (body.mode === "portfolio_report_auto" || body.mode === "portfolio_snapshot_build") {
+  if (body.mode === "portfolio_report_auto" || body.mode === "portfolio_snapshot_build" || body.mode === "portfolio_scope_debug") {
     return null;
   }
 
@@ -413,6 +415,69 @@ export function buildAutoPortfolioProjects(projects: TopvisorProjectMetadata[]) 
     skippedProjectsCount,
     warnings,
     projectsCount: projects.length,
+  };
+}
+
+async function buildPortfolioScopeDebugResponse(config: TopvisorConfig, body: SummaryReportBody) {
+  const forceRefreshScope = Boolean(body.force_refresh_scope);
+  const scopeCacheResult = await getDailyProjectScope(config, { forceRefresh: forceRefreshScope });
+  const autoPortfolioProjects = buildAutoPortfolioProjects(scopeCacheResult.projects);
+  const projects = scopeCacheResult.projects || [];
+  const generatedPairs = autoPortfolioProjects.projects || [];
+
+  const projectsWithRegions = projects.filter((project) => Array.isArray(project.regions) && project.regions.length > 0);
+  const rawRegionsTotal = projects.reduce((sum, project) => sum + (Array.isArray(project.regions) ? project.regions.length : 0), 0);
+  const uniqueProjectIds = new Set(generatedPairs.map((pair) => Number(pair.project_id)).filter((value) => Number.isFinite(value))).size;
+  const uniqueProjectRegionPairs = new Set(generatedPairs.map((pair) => `${pair.project_id}:${pair.region_index}`)).size;
+  const uniqueRegionIndexes = new Set(generatedPairs.map((pair) => Number(pair.region_index)).filter((value) => Number.isFinite(value))).size;
+
+  const topProjectsByRegions = projects
+    .map((project) => {
+      const regions = Array.isArray(project.regions) ? project.regions : [];
+      return {
+        project_id: Number(project.project_id),
+        project_name: project.project_name ?? null,
+        site: project.site ?? null,
+        regions_count: regions.length,
+        sample_regions: regions.slice(0, 10).map((region) => ({
+          region_index: Number(region.region_index),
+          region_name: region.region_name,
+        })),
+      };
+    })
+    .filter((project) => project.regions_count > 0)
+    .sort((left, right) => right.regions_count - left.regions_count)
+    .slice(0, 10);
+
+  const sampleGeneratedPairs = generatedPairs.slice(0, 20).map((pair) => ({
+    project_id: Number(pair.project_id),
+    region_index: Number(pair.region_index),
+  }));
+
+  return {
+    ok: true,
+    mode: "portfolio_scope_debug",
+    force_refresh_scope: forceRefreshScope,
+    scope_cache: {
+      enabled: true,
+      status: scopeCacheResult.status,
+      cache_key: scopeCacheResult.cacheKey,
+      cache_date: scopeCacheResult.cacheDate,
+      expires_at: scopeCacheResult.expiresAt,
+    },
+    counts: {
+      projects_total: projects.length,
+      projects_with_regions: projectsWithRegions.length,
+      projects_without_regions: projects.length - projectsWithRegions.length,
+      raw_regions_total: rawRegionsTotal,
+      generated_pairs_total: generatedPairs.length,
+      unique_project_ids: uniqueProjectIds,
+      unique_project_region_pairs: uniqueProjectRegionPairs,
+      unique_region_indexes: uniqueRegionIndexes,
+    },
+    top_projects_by_regions: topProjectsByRegions,
+    sample_generated_pairs: sampleGeneratedPairs,
+    warnings: [...scopeCacheResult.warnings, ...autoPortfolioProjects.warnings],
   };
 }
 
