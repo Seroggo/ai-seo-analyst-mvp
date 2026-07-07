@@ -5,7 +5,7 @@
   type TopvisorProjectMetadata,
 } from "../_shared/topvisor-client.ts";
 import { buildPortfolioMarkdownReport } from "../_shared/report-writer.ts";
-import { readTopvisorScopeCache, writeTopvisorScopeCache, type ScopeCacheStatus } from "../_shared/scope-cache.ts";
+import { readTopvisorScopeCache, writeTopvisorScopeCache, getSupabaseRestConfig, type ScopeCacheStatus } from "../_shared/scope-cache.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -99,6 +99,21 @@ type PortfolioGroups = {
   top10_10_20: PortfolioGroupItem[];
   top10_below_10: PortfolioGroupItem[];
   stale_or_missing_data: PortfolioGroupItem[];
+};
+
+type TopvisorProjectScopeRow = {
+  project_id: number;
+  project_name: string | null;
+  site: string | null;
+  region_index: number;
+  region_name: string | null;
+  search_engine: string;
+};
+
+type DailyProjectScopeMeta = {
+  scope_source: "public.topvisor_project_scope";
+  active_db_rows: number;
+  search_engine_breakdown: Record<string, number>;
 };
 
 Deno.serve(async (req: Request) => {
@@ -458,6 +473,7 @@ async function buildPortfolioScopeDebugResponse(config: TopvisorConfig, body: Su
     ok: true,
     mode: "portfolio_scope_debug",
     force_refresh_scope: forceRefreshScope,
+    scope_source: scopeCacheResult.scope_meta?.scope_source ?? "unknown",
     scope_cache: {
       enabled: true,
       status: scopeCacheResult.status,
@@ -474,6 +490,8 @@ async function buildPortfolioScopeDebugResponse(config: TopvisorConfig, body: Su
       unique_project_ids: uniqueProjectIds,
       unique_project_region_pairs: uniqueProjectRegionPairs,
       unique_region_indexes: uniqueRegionIndexes,
+      active_db_rows: scopeCacheResult.scope_meta?.active_db_rows ?? null,
+      search_engine_breakdown: scopeCacheResult.scope_meta?.search_engine_breakdown ?? null,
     },
     top_projects_by_regions: topProjectsByRegions,
     sample_generated_pairs: sampleGeneratedPairs,
@@ -945,7 +963,7 @@ async function getDailyProjectScope(config: TopvisorConfig, options: { forceRefr
   if (!forceRefresh) {
     const cacheResult = await readTopvisorScopeCache({ cacheKey, cacheDate });
     if (cacheResult.entry && cacheResult.available) {
-      const payload = cacheResult.entry.payload as { projects?: TopvisorProjectMetadata[] };
+      const payload = cacheResult.entry.payload as { projects?: TopvisorProjectMetadata[]; scope_meta?: DailyProjectScopeMeta };
       return {
         projects: Array.isArray(payload.projects) ? payload.projects : [],
         status: "hit" as ScopeCacheStatus,
@@ -953,31 +971,109 @@ async function getDailyProjectScope(config: TopvisorConfig, options: { forceRefr
         cacheDate,
         expiresAt: cacheResult.entry.expires_at,
         warnings: cacheResult.warning ? [cacheResult.warning] : [],
+        scope_meta: payload.scope_meta ?? null,
       };
     }
   }
 
-  const metadataLoadResult = await loadProjectMetadataMap(config);
-  const projects = Array.from(metadataLoadResult.metadataByProjectId.values());
-  const normalizedProjects = projects.map((project) => ({
-    ...project,
-    regions: (project.regions || []).filter((region) => Number.isFinite(Number(region.region_index)) && !!region.region_name),
-  }));
-  const payload = { projects: normalizedProjects };
+  const restConfig = getSupabaseRestConfig();
+  if (!restConfig) {
+    throw new Error("Supabase REST config unavailable. Cannot query topvisor_project_scope.");
+  }
+
+  let rows: TopvisorProjectScopeRow[];
+  try {
+    const url = new URL(`${restConfig.url}/rest/v1/topvisor_project_scope`);
+    url.searchParams.set("select", "project_id,project_name,site,region_index,region_name,search_engine");
+    url.searchParams.set("is_active", "eq.true");
+    url.searchParams.set("order", "project_id.asc,region_index.asc");
+
+    const response = await fetch(url, {
+      headers: {
+        apikey: restConfig.key,
+        Authorization: `Bearer ${restConfig.key}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`topvisor_project_scope query failed: HTTP ${response.status}`);
+    }
+
+    const result = await response.json();
+    if (!Array.isArray(result)) {
+      throw new Error("topvisor_project_scope query returned non-array response");
+    }
+    rows = result as TopvisorProjectScopeRow[];
+  } catch (error) {
+    throw new Error(`Failed to fetch active project scope: ${normalizeErrorMessage(error)}`);
+  }
+
+  if (rows.length === 0) {
+    throw new Error("Active project scope is empty. public.topvisor_project_scope has no active rows.");
+  }
+
+  const validRows = rows.filter(
+    (row) => Number.isFinite(Number(row.project_id)) && Number.isFinite(Number(row.region_index)),
+  );
+
+  if (validRows.length === 0) {
+    throw new Error("Active project scope rows are present, but none have valid project_id and region_index.");
+  }
+
+  const searchEngineBreakdown: Record<string, number> = {};
+  for (const row of validRows) {
+    const engine = row.search_engine ?? "unknown";
+    searchEngineBreakdown[engine] = (searchEngineBreakdown[engine] ?? 0) + 1;
+  }
+
+  const projectMap = new Map<number, TopvisorProjectMetadata>();
+  for (const row of validRows) {
+    const pid = Number(row.project_id);
+    let project = projectMap.get(pid);
+    if (!project) {
+      const displayName = row.project_name || row.site || `Project ${pid}`;
+      project = {
+        project_id: pid,
+        project_name: row.project_name ?? null,
+        site: row.site ?? null,
+        display_name: displayName,
+        regions: [],
+      };
+      projectMap.set(pid, project);
+    }
+    const rid = Number(row.region_index);
+    if (!project.regions.some((r) => r.region_index === rid)) {
+      project.regions.push({
+        region_index: rid,
+        region_name: row.region_name ?? `Region ${rid}`,
+      });
+    }
+  }
+
+  const projects = Array.from(projectMap.values());
+  const scopeMeta: DailyProjectScopeMeta = {
+    scope_source: "public.topvisor_project_scope",
+    active_db_rows: validRows.length,
+    search_engine_breakdown: searchEngineBreakdown,
+  };
+
+  const payload: Record<string, unknown> = {
+    projects: projects.map((p) => ({ ...p })),
+    scope_meta: scopeMeta,
+  };
 
   const writeResult = await writeTopvisorScopeCache({ cacheKey, cacheDate, payload });
-  const warnings = [
-    ...(metadataLoadResult.warning ? [metadataLoadResult.warning] : []),
-    ...(writeResult.warning ? [writeResult.warning] : []),
-  ];
+  const warnings = writeResult.warning ? [writeResult.warning] : [];
 
   return {
-    projects: normalizedProjects,
+    projects,
     status: writeResult.ok ? "miss_refreshed" as ScopeCacheStatus : "unavailable_live_fallback",
     cacheKey,
     cacheDate,
     expiresAt: writeResult.expiresAt,
     warnings,
+    scope_meta: scopeMeta,
   };
 }
 

@@ -152,7 +152,7 @@ export async function writeTopvisorScopeCache(params: {
   }
 }
 
-function getSupabaseRestConfig(): { url: string; key: string } | null {
+export function getSupabaseRestConfig(): { url: string; key: string } | null {
   const url = Deno.env.get("SUPABASE_URL");
   const key = resolveSupabaseSecretKey();
 
