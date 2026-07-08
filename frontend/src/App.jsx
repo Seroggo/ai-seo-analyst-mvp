@@ -4,24 +4,29 @@ import './App.css'
 const FUNCTION_URL = import.meta.env.VITE_SUPABASE_FUNCTION_URL
 const DEMO_TOKEN = import.meta.env.VITE_DEMO_TOKEN
 
-const DEMO_PAYLOAD = {
-  mode: 'portfolio_report',
-  date: '2026-06-07',
+const REPORT_FOCUSES = [
+  { key: 'overview', label: 'Общий обзор' },
+  { key: 'problem_projects', label: 'Топ проблемных проектов' },
+  { key: 'stale_data_projects', label: 'Проекты без свежих данных' },
+  { key: 'critical_top10_projects', label: 'Критически низкий TOP-10' },
+  { key: 'attention_queue', label: 'Проекты требуют внимания' },
+]
+
+const buildPayload = (reportFocus) => ({
+  mode: 'portfolio_report_auto',
+  date: '2026-06-29',
   report_mode: 'latest_available',
-  projects: [
-    {
-      project_id: 27366644,
-      region_index: 84,
-    },
-  ],
-}
+  report_focus: reportFocus,
+})
 
 function App() {
   const [status, setStatus] = useState('idle')
   const [report, setReport] = useState('')
   const [error, setError] = useState('')
+  const [activeFocus, setActiveFocus] = useState(null)
 
-  const handleGenerateReport = async () => {
+  const handleGenerateReport = async (reportFocus) => {
+    setActiveFocus(reportFocus)
     setStatus('loading')
     setReport('')
     setError('')
@@ -35,13 +40,15 @@ function App() {
         throw new Error('Не задана переменная VITE_DEMO_TOKEN')
       }
 
+      const payload = buildPayload(reportFocus)
+
       const response = await fetch(FUNCTION_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-demo-token': DEMO_TOKEN,
         },
-        body: JSON.stringify(DEMO_PAYLOAD),
+        body: JSON.stringify(payload),
       })
 
       const data = await response.json()
@@ -61,6 +68,8 @@ function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Неизвестная ошибка')
       setStatus('error')
+    } finally {
+      setActiveFocus(null)
     }
   }
 
@@ -78,16 +87,26 @@ function App() {
         <h1>AI SEO Analyst Demo</h1>
         
         <div className="actions">
-          <button onClick={handleGenerateReport} disabled={status === 'loading'}>
-            {status === 'loading' ? 'Формируем...' : 'Краткий SEO-отчёт'}
+          <button
+            onClick={() => handleGenerateReport('overview')}
+            disabled={status === 'loading'}
+            className={activeFocus === 'overview' ? 'scenario-active' : ''}
+          >
+            {activeFocus === 'overview' ? 'Формируем...' : 'Краткий SEO-отчёт'}
           </button>
         </div>
 
-        <div className="scenario-grid" aria-label="Будущие сценарии">
-          <button disabled>Топ проблемных проектов</button>
-          <button disabled>Проекты без свежих данных</button>
-          <button disabled>Критически низкий TOP-10</button>
-          <button disabled>Проекты требуют внимания</button>
+        <div className="scenario-grid" aria-label="Сценарии отчётов">
+          {REPORT_FOCUSES.filter(f => f.key !== 'overview').map(({ key, label }) => (
+            <button
+              key={key}
+              onClick={() => handleGenerateReport(key)}
+              disabled={status === 'loading'}
+              className={activeFocus === key ? 'scenario-active' : ''}
+            >
+              {activeFocus === key ? 'Формируем...' : label}
+            </button>
+          ))}
         </div>
       </section>
 

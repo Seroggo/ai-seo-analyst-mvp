@@ -89,6 +89,11 @@ h1 {
   text-align: left;
 }
 
+button.scenario-active {
+  background: #fff4d8;
+  color: #7a5300;
+}
+
 .panel {
   margin-top: 24px;
   background: #ffffff;
